@@ -61,7 +61,7 @@ def get(key):
 
 
 def put(key, value):
-    with connect() as c:
+    with db() as c:
         c.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                   (key, json.dumps(value)))
         c.commit()
@@ -72,7 +72,7 @@ def cash():
 
 
 def pending():
-    with connect() as c:
+    with db() as c:
         return c.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY id LIMIT 1").fetchone()
 
 
@@ -120,7 +120,7 @@ def settle_pending():
     payout = settle(float(pos["shares"]), pos["side"], result)
     pnl = payout - float(pos["cash_spent"])
     new_cash = cash() + payout
-    with connect() as c:
+    with db() as c:
         c.execute("UPDATE trades SET resolved_outcome=?,payout=?,pnl=?,cash_after=?,status='SETTLED' WHERE id=? AND status='OPEN'",
                   (result, payout, pnl, new_cash, pos["id"]))
         c.execute("UPDATE settings SET value=? WHERE key='cash'", (json.dumps(new_cash),))
@@ -135,7 +135,7 @@ def scan():
     candidates = []
     for _event, market, up_id, down_id, _start, end in discover(300):
         mid = str(market.get("id"))
-        with connect() as c:
+        with db() as c:
             if c.execute("SELECT 1 FROM trades WHERE market_id=?", (mid,)).fetchone():
                 continue
         left = end - now
@@ -156,7 +156,7 @@ def scan():
     fill = paper_buy(cash(), decision.ask, 1.0, 0.0)
     if not fill:
         return
-    with connect() as c:
+    with db() as c:
         c.execute("""INSERT INTO trades(market_id,market_slug,question,entry_time,seconds_to_end,side,entry_ask,
           cash_spent,shares,status) VALUES(?,?,?,?,?,?,?,?,?,'OPEN')""",
           (str(market.get("id")), market.get("slug"), market.get("question"),
@@ -179,7 +179,7 @@ def engine():
 
 
 def stats():
-    with connect() as c:
+    with db() as c:
         rows = c.execute("SELECT pnl FROM trades WHERE status='SETTLED'").fetchall()
     pnls = [float(x["pnl"]) for x in rows]
     wins = sum(x > 0 for x in pnls)
@@ -204,7 +204,7 @@ def command(chat, user, message):
     elif cmd == "/stats":
         send(chat, stats())
     elif cmd == "/trades":
-        with connect() as c:
+        with db() as c:
             rows = c.execute("SELECT side,entry_ask,status,pnl,market_slug FROM trades ORDER BY id DESC LIMIT 8").fetchall()
         send(chat, "\n".join(f"{r['side']} @{r['entry_ask']:.3f} {r['status']} {r['market_slug']} {'' if r['pnl'] is None else f'P&L {r["pnl"]:+.2f}'}" for r in rows) or "No trades yet.")
     elif cmd == "/settings":
@@ -255,7 +255,7 @@ def main():
         raise SystemExit("Configure TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_ID.")
     if INITIAL_CASH <= 0:
         raise SystemExit("BOT_INITIAL_CASH must be positive.")
-    with connect() as c:
+    with db() as c:
         c.execute("INSERT OR IGNORE INTO settings VALUES('active','false')")
         c.commit()
     print("PAPER-ONLY bot started. Send /status or /start in Telegram.", flush=True)
