@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,8 +41,21 @@ def connect():
     return c
 
 
+@contextmanager
+def db():
+    conn = connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get(key):
-    with connect() as c:
+    with db() as c:
         row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return json.loads(row["value"]) if row else DEFAULTS.get(key)
 
