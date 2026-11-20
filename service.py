@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+import paper_session
 from collector import discover, get_book, SESSION, GAMMA
 from strategy import choose_side, paper_buy, settle
 
@@ -34,6 +35,7 @@ def connect():
       entry_time TEXT NOT NULL, seconds_to_end REAL NOT NULL, side TEXT NOT NULL, entry_ask REAL NOT NULL,
       cash_spent REAL NOT NULL, shares REAL NOT NULL, resolved_outcome TEXT, payout REAL, pnl REAL,
       cash_after REAL, status TEXT NOT NULL DEFAULT 'OPEN')""")
+    paper_session.initialize(c)
     c.execute("INSERT OR IGNORE INTO settings VALUES('cash',?)", (json.dumps(INITIAL_CASH),))
     for k, v in DEFAULTS.items():
         c.execute("INSERT OR IGNORE INTO settings VALUES(?,?)", (k, json.dumps(v)))
@@ -81,7 +83,7 @@ def send(chat, text):
         try:
             requests.post(f"{TG}/sendMessage", json={"chat_id": chat, "text": text}, timeout=15).raise_for_status()
         except requests.RequestException as exc:
-            print(f"Telegram send failed: {exc}", flush=True)
+            print(f"Telegram send failed: {type(exc).__name__}", flush=True)
 
 
 def notify(text):
@@ -119,21 +121,31 @@ def settle_pending():
         return
     payout = settle(float(pos["shares"]), pos["side"], result)
     pnl = payout - float(pos["cash_spent"])
-    new_cash = cash() + payout
     with db() as c:
-        c.execute("UPDATE trades SET resolved_outcome=?,payout=?,pnl=?,cash_after=?,status='SETTLED' WHERE id=? AND status='OPEN'",
-                  (result, payout, pnl, new_cash, pos["id"]))
-        c.execute("UPDATE settings SET value=? WHERE key='cash'", (json.dumps(new_cash),))
-        c.commit()
-    notify(f"🏁 SETTLED: {'WIN' if pnl > 0 else 'LOSS'}\n{pos['market_slug']}\nSelected {pos['side']} | Result {result}\nP&L ${pnl:+.2f}\nVirtual balance ${new_cash:.2f}")
+        c.execute("BEGIN IMMEDIATE")
+        settled = c.execute(
+            "UPDATE trades SET resolved_outcome=?,payout=?,pnl=?,status='SETTLED' WHERE id=? AND status='OPEN'",
+            (result, payout, pnl, pos["id"]),
+        )
+        if settled.rowcount != 1:
+            return
+        balance = float(c.execute("SELECT value FROM settings WHERE key='cash'").fetchone()[0])
+        new_cash, transfer_note = paper_session.transfer(c, pos["id"], balance + payout)
+        paper_session.set_cash(c, new_cash)
+        c.execute("UPDATE trades SET cash_after=? WHERE id=?", (new_cash, pos["id"]))
+    notify(f"🏁 SETTLED: {'WIN' if pnl > 0 else 'LOSS'}\n{pos['market_slug']}\nSelected {pos['side']} | Result {result}\nP&L ${pnl:+.2f}\nVirtual balance ${new_cash:.2f}{transfer_note}")
 
 
 def scan():
     if cash() <= 0 or pending():
         return
     now = time.time()
+    with db() as c:
+        session = paper_session.latest(c)
+        if not paper_session.accepts_entry(c, session, now):
+            return
     candidates = []
-    for _event, market, up_id, down_id, _start, end in discover(300):
+    for _event, market, up_id, down_id, _start, end in discover():
         mid = str(market.get("id"))
         with db() as c:
             if c.execute("SELECT 1 FROM trades WHERE market_id=?", (mid,)).fetchone():
@@ -149,28 +161,56 @@ def scan():
             continue
         decision = choose_side(ua, da, float(get("threshold")))
         if decision:
-            candidates.append((decision.ask, market, left, decision))
+            candidates.append((decision.ask, market, end, decision))
     if not candidates:
         return
-    _price, market, left, decision = max(candidates, key=lambda x: x[0])
-    fill = paper_buy(cash(), decision.ask, 1.0, 0.0)
-    if not fill:
-        return
     with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        now = time.time()
+        current = paper_session.latest(c)
+        if (current and current["id"]) != (session and session["id"]):
+            return
+        if not paper_session.accepts_entry(c, current, now):
+            return
+        if c.execute("SELECT 1 FROM trades WHERE status='OPEN'").fetchone():
+            return
+        eligible = [candidate for candidate in candidates if candidate[2] > now]
+        if not eligible:
+            return
+        _price, market, end, decision = max(eligible, key=lambda candidate: candidate[0])
+        if c.execute("SELECT 1 FROM trades WHERE market_id=?", (str(market.get("id")),)).fetchone():
+            return
+        balance = float(c.execute("SELECT value FROM settings WHERE key='cash'").fetchone()[0])
+        fill = paper_buy(balance, decision.ask, 1.0, 0.0)
+        if not fill:
+            return
+        left = end - now
         c.execute("""INSERT INTO trades(market_id,market_slug,question,entry_time,seconds_to_end,side,entry_ask,
           cash_spent,shares,status) VALUES(?,?,?,?,?,?,?,?,?,'OPEN')""",
           (str(market.get("id")), market.get("slug"), market.get("question"),
-           datetime.now(timezone.utc).isoformat(), round(left, 2), decision.side,
+           datetime.fromtimestamp(now, timezone.utc).isoformat(), round(left, 2), decision.side,
            decision.ask, fill["cash_spent"], fill["shares"]))
-        c.execute("UPDATE settings SET value='0' WHERE key='cash'")
-        c.commit()
+        paper_session.set_cash(c, 0)
     notify(f"📝 PAPER TRADE\n{market.get('question') or market.get('slug')}\nSide {decision.side} @ {decision.ask:.3f}\nT-{left:.1f}s\nVirtual stake ${fill['cash_spent']:.2f}\nNo real order placed.")
+
+
+def close_session_if_due():
+    now = time.time()
+    with db() as c:
+        session = paper_session.latest(c)
+        if session is None or session["report"] is not None or now < session["ends_at"]:
+            return
+        c.execute("BEGIN IMMEDIATE")
+        report = paper_session.report_if_finished(c, now)
+    if report:
+        notify(report)
 
 
 def engine():
     while not stop_event.is_set():
         try:
             settle_pending()
+            close_session_if_due()
             if get("active") and not pending():
                 scan()
         except Exception as exc:
@@ -192,13 +232,49 @@ def command(chat, user, message):
     parts = message.split()
     cmd = parts[0].split("@")[0].lower() if parts else ""
     args = parts[1:]
-    if cmd in ("/start", "/resume"):
-        put("active", True); send(chat, "▶️ Paper monitoring ON. No wallet or live orders.")
+    if cmd == "/overnight":
+        if len(args) != 1 or len(args[0]) > 100:
+            send(chat, "Usage: /overnight <virtual-wallet-label>. Example: /overnight vault")
+            return
+        with db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            reply = paper_session.start(c, args[0], time.time())
+        send(chat, reply)
+    elif cmd in ("/start", "/resume"):
+        with db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            session = paper_session.latest(c)
+            if session and time.time() >= session["ends_at"]:
+                reply = "The entry window ended. Use /report or start a new /overnight session."
+            else:
+                paper_session.set_enabled(c, True)
+                reply = "▶️ Paper monitoring ON."
+        send(chat, reply)
     elif cmd in ("/stop", "/pause"):
         put("active", False); send(chat, "⏸️ New entries paused. Open position still monitored.")
     elif cmd == "/status":
         p = pending()
-        send(chat, f"Monitoring: {'ON' if get('active') else 'OFF'}\nVirtual cash: ${cash():.2f}\nOpen position: {p['side']+' @ '+str(p['entry_ask']) if p else 'None'}")
+        with db() as c:
+            session = paper_session.latest(c)
+        deadline = f"\nOvernight entry cutoff: {paper_session.utc_label(session['ends_at'])}" if session else ""
+        active = get("active") and (session is None or time.time() < session["ends_at"])
+        send(chat, f"Monitoring: {'ON' if active else 'OFF'}\nVirtual cash: ${cash():.2f}\nOpen position: {p['side']+' @ '+str(p['entry_ask']) if p else 'None'}{deadline}")
+    elif cmd == "/wallet":
+        with db() as c:
+            reply = paper_session.wallet_summary(c)
+        send(chat, reply)
+    elif cmd == "/report":
+        with db() as c:
+            session = paper_session.latest(c)
+        if session is None:
+            reply = "No overnight session yet. Use /overnight <virtual-wallet-label>."
+        elif session["report"] is not None:
+            reply = session["report"]
+        elif time.time() >= session["ends_at"]:
+            reply = "Entry window closed. Final report is pending settlement or the next bot check."
+        else:
+            reply = f"Overnight session in progress. Entries close at {paper_session.utc_label(session['ends_at'])}."
+        send(chat, reply)
     elif cmd == "/balance":
         send(chat, f"Virtual balance: ${cash():.2f}" + (" (position open)" if pending() else ""))
     elif cmd == "/stats":
@@ -223,13 +299,13 @@ def command(chat, user, message):
     elif cmd == "/markets":
         try:
             now = time.time()
-            found = [(m, end-now) for _e,m,_u,_d,_s,end in discover(300) if 0 <= end-now <= 600]
+            found = [(m, end-now) for _e,m,_u,_d,_s,end in discover() if 0 <= end-now <= 600]
             found.sort(key=lambda x:x[1])
             send(chat, "\n".join(f"{m.get('slug')} T-{s:.0f}s" for m,s in found[:10]) or "No eligible markets found.")
         except requests.RequestException as exc:
             send(chat, f"Market lookup failed: {exc}")
     else:
-        send(chat, "/start /stop /status /balance /trades /stats /markets /settings\n/set threshold 0.82\n/set entry_window 120\n/set poll_seconds 2\n/help")
+        send(chat, "/overnight <virtual-wallet-label> /wallet /report\n/start /stop /status /balance /trades /stats /markets /settings\n/set threshold 0.82\n/set entry_window 120\n/set poll_seconds 2\n/help")
 
 
 def telegram():
@@ -246,7 +322,7 @@ def telegram():
                 if msg and msg.get("text"):
                     command(str(msg["chat"]["id"]), str(msg.get("from", {}).get("id", "")), msg["text"])
         except requests.RequestException as exc:
-            print(f"Telegram polling error: {exc}", flush=True)
+            print(f"Telegram polling error: {type(exc).__name__}", flush=True)
             stop_event.wait(3)
 
 

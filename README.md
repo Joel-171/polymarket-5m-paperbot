@@ -3,7 +3,7 @@
 Paper-only research software. Telegram controls monitoring and reports. The engine reads public Polymarket Gamma/CLOB data, simulates positions and records outcomes. It has no wallet, private keys, signing or live-order endpoint.
 
 ## Strategy defaults
-- Heuristic discovery of crypto five-minute UP/DOWN markets.
+- Looks up current BTC, ETH, SOL, and XRP five-minute UP/DOWN markets.
 - Entry during final 120 seconds.
 - Trigger: best executable ask >= 0.80.
 - Choose the highest qualifying ask among discovered eligible markets.
@@ -16,6 +16,30 @@ An 80-cent contract is not proof of an 80% true win probability. A losing all-in
 /start resume monitoring; /stop pause new entries; /status; /balance; /trades; /stats; /markets; /settings; /help.
 Change settings with /set threshold 0.82, /set entry_window 120, or /set poll_seconds 2.
 Only TELEGRAM_ALLOWED_USER_ID can control the bot.
+
+## Six-hour paper session
+
+Run the bot on a computer with Python 3.12 or newer. Install the dependencies
+with `python -m pip install -r requirements.txt`, set
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_ID` in the process environment,
+and run `python service.py`. The service does not load `.env.example`.
+Use `/status` in Telegram to confirm it responds.
+
+- At 22:00 Ghana time (UTC), send `/overnight vault` to start a fresh $10
+  paper session. Replace `vault` with any single-word label or public address.
+  No wallet connection or private key is needed. Keep the computer awake and online.
+- The session follows the current paper strategy settings, with one entry
+  per five-minute session window at most. When settled cash reaches $10,000,
+  the bot logs a simulated transfer of everything above $10 to that label.
+  It keeps $10 in play. A loss can exhaust the bankroll.
+- New entries close after six hours (04:00 UTC for a 22:00 start). Any open
+  trade still settles. The bot then sends the final report to the authorized
+  Telegram user. `/report` retrieves it and `/wallet` shows virtual transfers
+  grouped by destination.
+- The cutoff, open position, and virtual transfers survive a process restart
+  with the same SQLite database. `/stop` pauses entries without extending the
+  cutoff. Starting another session creates a fresh $10 paper bankroll and
+  retains the previous trade and transfer history.
 
 ## Create Telegram credentials
 1. In Telegram, open the verified @BotFather and send /newbot.
@@ -36,4 +60,4 @@ python -m unittest discover -s tests -v
 python -m py_compile collector.py strategy.py backtest.py service.py
 
 ## Limitations
-Market discovery is heuristic and may miss markets or include false positives. Inspect each market's exact question and resolution terms. The bot uses best ask as a paper fill and does not model depth walking, partial fills, latency, queue position, impact or market-specific fees. The settlement heuristic is not a substitute for verifying official resolution. No profitability claim is made. Historical snapshots and verified settlements are required for meaningful backtesting.
+Market discovery depends on Polymarket's current five-minute event slug format. Inspect each market's exact question and resolution terms. The bot uses best ask as a paper fill and does not model depth walking, partial fills, latency, queue position, impact or market-specific fees. The settlement heuristic is not a substitute for verifying official resolution. No profitability claim is made. Historical snapshots and verified settlements are required for meaningful backtesting.
