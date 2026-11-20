@@ -1,10 +1,12 @@
 """Read-only Gamma/CLOB market discovery and order-book access."""
 import json
+import time
 from datetime import datetime
 import requests
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
+FIVE_MINUTE_SYMBOLS = ("btc", "eth", "sol", "xrp")
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "polymarket-paper-research/1.0"})
 
@@ -27,16 +29,6 @@ def timestamp(value):
         return None
 
 
-def candidate_text(event, market):
-    text = " ".join(str(x or "") for x in (
-        event.get("title"), event.get("slug"), market.get("question"), market.get("slug")
-    )).lower()
-    crypto = any(x in text for x in ("bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp"))
-    direction = any(x in text for x in ("up or down", "updown", "up-down"))
-    duration = any(x in text for x in ("5m", "5-min", "5 min", "five minute"))
-    return crypto and direction and duration
-
-
 def token_ids(market):
     outcomes, ids = as_list(market.get("outcomes")), as_list(market.get("clobTokenIds"))
     if len(outcomes) != 2 or len(ids) != 2:
@@ -57,19 +49,21 @@ def get_book(token_id):
     return bid, ask, depth
 
 
-def discover(limit=300):
-    r = SESSION.get(f"{GAMMA}/events", params={"active": "true", "closed": "false", "limit": limit}, timeout=20)
-    r.raise_for_status()
-    payload = r.json()
-    events = payload if isinstance(payload, list) else payload.get("events", [])
+def discover():
+    slot_start = int(time.time()) // 300 * 300
     found = []
-    for event in events:
+    for symbol in FIVE_MINUTE_SYMBOLS:
+        slug = f"{symbol}-updown-5m-{slot_start}"
+        r = SESSION.get(f"{GAMMA}/events/slug/{slug}", timeout=12)
+        if r.status_code == 404:
+            continue
+        r.raise_for_status()
+        event = r.json()
         for market in event.get("markets") or []:
-            if not candidate_text(event, market):
+            if market.get("slug") != slug or market.get("closed") or not market.get("acceptingOrders"):
                 continue
             up, down = token_ids(market)
             end = timestamp(market.get("endDate") or event.get("endDate"))
-            start = timestamp(market.get("startDate") or event.get("startDate"))
-            if up and down and end:
-                found.append((event, market, up, down, start, end))
+            if up and down and end == slot_start + 300:
+                found.append((event, market, up, down, slot_start, end))
     return found
