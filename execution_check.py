@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 
 import requests
 
-from collector import CLOB, FIVE_MINUTE_SYMBOLS, SESSION, discover
+from collector import FIVE_MINUTE_SYMBOLS, discover, read_order_book
 
 SHARE_STEP = Decimal("0.01")
 FEE_STEP = Decimal("0.00001")
@@ -56,6 +56,15 @@ def estimate_buy(book, budget, max_price, fee_rate):
     }
 
 
+def market_fee_rate(market):
+    if market.get("feesEnabled") is False:
+        return Decimal(0)
+    schedule = market.get("feeSchedule") or {}
+    if market.get("feesEnabled") is not True or schedule.get("exponent") != 1:
+        raise ValueError("Fee schedule is missing or uses an unsupported exponent.")
+    return Decimal(str(schedule["rate"]))
+
+
 def check_current_market(asset, side, budget, max_price):
     for _event, market, up_token, down_token, _start, end in discover():
         if market["slug"].startswith(f"{asset}-"):
@@ -63,17 +72,9 @@ def check_current_market(asset, side, budget, max_price):
     else:
         raise ValueError(f"No current {asset.upper()} market is accepting orders.")
 
-    if market.get("feesEnabled") is False:
-        rate = Decimal(0)
-    else:
-        schedule = market.get("feeSchedule") or {}
-        if market.get("feesEnabled") is not True or schedule.get("exponent") != 1:
-            raise ValueError("Fee schedule is missing or uses an unsupported exponent.")
-        rate = Decimal(str(schedule["rate"]))
+    rate = market_fee_rate(market)
     token = up_token if side == "UP" else down_token
-    response = SESSION.get(f"{CLOB}/book", params={"token_id": token}, timeout=12)
-    response.raise_for_status()
-    book = response.json()
+    book = read_order_book(token)
     if time.time() >= end:
         raise ValueError("The market expired during the check. Run it again for the next window.")
     result = estimate_buy(book, budget, max_price, rate)
