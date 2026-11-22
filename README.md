@@ -41,6 +41,19 @@ Use `/status` in Telegram to confirm it responds.
   cutoff. Starting another session creates a fresh $10 paper bankroll and
   retains the previous trade and transfer history.
 
+## Check an order-book quote
+
+Run `python execution_check.py xrp down 10 0.82` to check the current XRP
+five-minute DOWN market for a $10 budget and a maximum price of $0.82.
+Use `btc`, `eth`, `sol`, or `xrp` and choose `up` or `down`.
+
+The check reads the public book and the market's taker fee schedule. It reports
+the best ask, visible shares at that exact price, estimated shares and fees,
+and the source book's timestamp and hash. It rejects orders above the cap,
+below the market minimum, or too large for the best ask. It uses a conservative
+two-decimal share estimate. This is a snapshot, and liquidity can change before
+an order reaches the exchange. The check has no credentials and places no order.
+
 ## Create Telegram credentials
 1. In Telegram, open the verified @BotFather and send /newbot.
 2. Save the token privately. Never commit it to GitHub.
