@@ -114,8 +114,20 @@ def market_for(market_id):
     return r.json()
 
 
-def outcome_for(market_id):
-    m = market_for(market_id)
+def outcome_for(market_id, slug=None):
+    if slug:
+        response = SESSION.get(
+            f"{GAMMA}/markets/slug/{slug}", headers={"Cache-Control": "no-cache"}, timeout=12,
+        )
+        if response.status_code == 404:
+            m = market_for(market_id)
+        else:
+            response.raise_for_status()
+            m = response.json()
+            if str(m.get("id")) != str(market_id):
+                return None
+    else:
+        m = market_for(market_id)
     resolved = m.get("automaticallyResolved") is True or m.get("umaResolutionStatus") == "resolved"
     if not m.get("closed") or not resolved:
         return None
@@ -163,7 +175,7 @@ def settle_pending():
     if not pos:
         return
     try:
-        result = outcome_for(pos["market_id"])
+        result = outcome_for(pos["market_id"], pos["market_slug"])
     except requests.RequestException as exc:
         print(f"Settlement API error: {exc}", flush=True)
         return
@@ -345,7 +357,7 @@ def verify_early_sale(after_id=0):
     if trade is None:
         return after_id
     try:
-        outcome = outcome_for(trade["market_id"])
+        outcome = outcome_for(trade["market_id"], trade["market_slug"])
     except requests.RequestException as exc:
         print(f"Paper sale resolution lookup failed: {type(exc).__name__}", flush=True)
         return trade["id"]

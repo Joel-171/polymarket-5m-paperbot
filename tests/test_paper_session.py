@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import paper_session
 import service
@@ -232,14 +232,32 @@ class TestPaperSession(unittest.TestCase):
     def test_saved_position_settles_when_result_is_automatic_without_uma_status(self):
         self.scan(1, self.start + 210, self.start + 300)
         result = {
+            "id": "1",
             "closed": True, "automaticallyResolved": True, "umaResolutionStatus": None,
             "outcomes": '["Up", "Down"]', "outcomePrices": '["1", "0"]',
         }
-        with patch.object(service, "market_for", return_value=result):
+        response = Mock(status_code=200, **{"json.return_value": result})
+        with patch.object(service.SESSION, "get", return_value=response) as get:
             service.settle_pending()
+        get.assert_called_once_with(
+            f"{service.GAMMA}/markets/slug/market-1", headers={"Cache-Control": "no-cache"}, timeout=12,
+        )
         self.assertIsNone(service.pending())
         self.assertEqual(service.cash(), 12.5)
         self.assertIn("SETTLED: WIN", self.send.call_args.args[1])
+
+    def test_slug_lookup_falls_back_to_id_on_missing_slug_and_rejects_wrong_market(self):
+        resolved = {"id": "2", "closed": True, "automaticallyResolved": True,
+                    "outcomes": ["Up", "Down"], "outcomePrices": ["1", "0"]}
+        with (
+            patch.object(service.SESSION, "get", side_effect=[
+                Mock(status_code=200, **{"json.return_value": resolved}), Mock(status_code=404),
+            ]),
+            patch.object(service, "market_for", return_value={**resolved, "id": "1"}) as by_id,
+        ):
+            self.assertIsNone(service.outcome_for("1", "market-1"))
+            self.assertEqual(service.outcome_for("1", "market-1"), "UP")
+        by_id.assert_called_once_with("1")
 
     def test_does_not_treat_closed_or_indicative_prices_as_final(self):
         market = {"closed": True, "outcomes": ["Up", "Down"], "outcomePrices": ["0", "1"]}
