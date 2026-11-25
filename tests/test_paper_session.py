@@ -17,6 +17,7 @@ class TestPaperSession(unittest.TestCase):
             ALLOWED_USER_ID="123",
         ))
         self.send = self.enterContext(patch.object(service, "send"))
+        self.enterContext(patch.object(service.stop_event, "wait", return_value=False))
         with patch.object(service.time, "time", return_value=self.start):
             service.command("123", "123", "/overnight vault")
 
@@ -136,16 +137,94 @@ class TestPaperSession(unittest.TestCase):
             service.scan()
         discover.assert_not_called()
 
-    def test_scan_rejects_thin_book_then_records_estimated_fee_and_depth(self):
-        self.scan(1, self.start + 210, self.start + 300, size="5", fee="0.05")
+    def test_scan_skips_subminimum_book_then_records_partial_fill(self):
+        self.scan(1, self.start + 210, self.start + 300, size="4", fee="0.05")
         self.assertIsNone(service.pending())
         self.assertEqual(service.cash(), 10)
-        self.scan(1, self.start + 220, self.start + 300, size="15", fee="0.05")
+        self.scan(1, self.start + 220, self.start + 300, size="7", fee="0.05")
         trade = service.pending()
-        self.assertGreater(trade["shares"], 5)
+        self.assertEqual(trade["shares"], 7)
+        self.assertGreater(service.cash(), 4)
         self.assertAlmostEqual(trade["cash_spent"] + service.cash(), 10)
         with service.db() as conn:
             audit = conn.execute("SELECT * FROM paper_execution WHERE trade_id=?", (trade["id"],)).fetchone()
-        self.assertEqual(audit["available_shares"], 15)
+        self.assertEqual(audit["available_shares"], 7)
         self.assertEqual(audit["book_hash"], "snapshot")
         self.assertGreater(audit["estimated_fee"], 0)
+
+    def sell(self, price, size, fee="0"):
+        now = self.start + 260
+        with (
+            patch.object(service.time, "time", return_value=now),
+            patch.object(service, "market_for", return_value={
+                "acceptingOrders": True, "outcomes": ["Up", "Down"],
+                "clobTokenIds": ["up", "down"], "feesEnabled": fee != "0",
+                "feeSchedule": {"exponent": 1, "rate": fee},
+            }),
+            patch.object(service, "read_order_book", return_value={
+                "bids": [{"price": price, "size": size}],
+                "timestamp": str(now * 1000), "min_order_size": "5",
+            }),
+        ):
+            service.command("123", "123", "/sell")
+
+    def test_sell_checks_fees_and_partial_sale_settles_once(self):
+        self.scan(1, self.start + 210, self.start + 300, fee="0.05")
+        self.sell("0.805", "7", fee="0.05")
+        self.assertIn("profitable bid", self.send.call_args.args[1])
+        cash_before = service.cash()
+        self.sell("0.90", "7", fee="0.05")
+        self.assertIn("7.00 shares", self.send.call_args.args[1])
+        self.assertAlmostEqual(service.cash(), cash_before + 6.3 - .0315)
+        self.sell("0.90", "7", fee="0.05")
+        self.assertIn("snapshot was already used", self.send.call_args.args[1])
+        self.assertAlmostEqual(service.cash(), cash_before + 6.3 - .0315)
+        with patch.object(service, "outcome_for", return_value="DOWN"):
+            service.settle_pending()
+            service.settle_pending()
+        with service.db() as conn:
+            trade = conn.execute("SELECT * FROM trades").fetchone()
+        self.assertAlmostEqual(trade["pnl"], service.cash() - 10)
+        self.assertIsNone(service.pending())
+
+    def test_full_sale_ends_position_and_blocks_reentry_in_same_window(self):
+        self.scan(1, self.start + 210, self.start + 300)
+        self.sell("0.90", "15")
+        self.assertIsNone(service.pending())
+        self.assertEqual(service.cash(), 11.25)
+        self.scan(2, self.start + 270, self.start + 300)
+        self.assertIsNone(service.pending())
+        with (
+            patch.object(service.time, "time", return_value=self.start + 301),
+            patch.object(service, "outcome_for", return_value="UP"),
+        ):
+            service.verify_early_sale()
+        self.assertIn("Holding: $+2.50", self.send.call_args.args[1])
+        self.assertEqual(service.cash(), 11.25)
+
+    def test_endsession_reports_now_if_flat_and_blocks_resume(self):
+        now = self.start + 100
+        with patch.object(service.time, "time", return_value=now):
+            service.command("123", "123", "/endsession")
+            self.assertIn("Paper session ended.", self.send.call_args.args[1])
+            service.command("123", "123", "/resume")
+        self.assertIn("window ended", self.send.call_args.args[1])
+        self.assertFalse(service.get("active"))
+
+    def test_endsession_timeout_sends_provisional_then_final_report(self):
+        now = self.start + 240
+        self.scan(1, self.start + 210, self.start + 300)
+        with patch.object(service.time, "time", return_value=now):
+            service.command("123", "123", "/endsession")
+        self.assertIn("when the open position settles", self.send.call_args.args[1])
+        with patch.object(service.time, "time", return_value=now + paper_session.SETTLEMENT_TIMEOUT):
+            service.close_session_if_due()
+            self.assertIn("Unsettled position at cost: $10.00", self.send.call_args.args[1])
+            calls = self.send.call_count
+            service.close_session_if_due()
+            self.assertEqual(self.send.call_count, calls)
+            with patch.object(service, "outcome_for", return_value="UP"):
+                service.settle_pending()
+            service.close_session_if_due()
+        self.assertIn("Net P&L: $+2.50", self.send.call_args.args[1])
+        self.assertIn("100.0% vs 80.0% break-even", self.send.call_args.args[1])

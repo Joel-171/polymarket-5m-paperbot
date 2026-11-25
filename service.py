@@ -11,9 +11,9 @@ from pathlib import Path
 
 import requests
 import paper_session
-from collector import discover_cached, get_asks, read_order_book, SESSION, GAMMA
-from execution_check import estimate_buy, market_fee_rate
-from strategy import choose_side, settle
+from collector import as_list, discover_cached, get_asks, read_order_book, token_ids, SESSION, GAMMA
+from execution_check import SHARE_STEP, estimate_buy, estimate_profitable_sell, market_fee_rate
+from strategy import choose_side
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -25,6 +25,7 @@ DEFAULTS = {"threshold": 0.80, "entry_window": 120, "poll_seconds": 10.0}
 MIN_QUOTE_INTERVAL = 10
 SETTLEMENT_INTERVAL = 30
 MAX_BOOK_AGE = 15
+PAPER_FILL_DELAY = 0.3
 TG = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
 stop_event = threading.Event()
 
@@ -44,6 +45,12 @@ def connect():
       trade_id INTEGER PRIMARY KEY REFERENCES trades(id), token_id TEXT NOT NULL,
       book_time_ms INTEGER NOT NULL, book_hash TEXT, available_shares REAL NOT NULL,
       estimated_fee REAL NOT NULL
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS paper_sales(
+      id INTEGER PRIMARY KEY, trade_id INTEGER NOT NULL REFERENCES trades(id),
+      sold_at TEXT NOT NULL, shares REAL NOT NULL, price REAL NOT NULL,
+      fee REAL NOT NULL, net_proceeds REAL NOT NULL, book_key TEXT NOT NULL,
+      UNIQUE(trade_id, book_key)
     )""")
     paper_session.initialize(c)
     c.execute("INSERT OR IGNORE INTO settings VALUES('cash',?)", (json.dumps(INITIAL_CASH),))
@@ -101,21 +108,51 @@ def notify(text):
         send(ALLOWED_USER_ID, text)
 
 
-def outcome_for(market_id):
+def market_for(market_id):
     r = SESSION.get(f"{GAMMA}/markets/{market_id}", timeout=12)
     r.raise_for_status()
-    m = r.json()
-    if not m.get("closed"):
+    return r.json()
+
+
+def outcome_for(market_id):
+    m = market_for(market_id)
+    if not m.get("closed") or m.get("umaResolutionStatus") != "resolved":
         return None
-    from collector import as_list
     outcomes, prices = as_list(m.get("outcomes")), as_list(m.get("outcomePrices"))
     if len(outcomes) != 2 or len(prices) != 2:
         return None
     try:
-        winners = [str(o).strip().upper() for o, p in zip(outcomes, prices) if float(p) >= .99]
+        winners = [str(o).strip().upper() for o, p in zip(outcomes, prices) if float(p) == 1]
     except (ValueError, TypeError):
         return None
     return winners[0] if len(winners) == 1 and winners[0] in {"UP", "DOWN"} else None
+
+
+def market_close(trade):
+    return datetime.fromisoformat(trade["entry_time"]).timestamp() + trade["seconds_to_end"]
+
+
+def balance_in(conn):
+    return Decimal(conn.execute("SELECT value FROM settings WHERE key='cash'").fetchone()[0])
+
+
+def sales_for(conn, trade_id):
+    shares, proceeds = conn.execute(
+        "SELECT COALESCE(SUM(shares), 0), COALESCE(SUM(net_proceeds), 0) FROM paper_sales WHERE trade_id=?",
+        (trade_id,),
+    ).fetchone()
+    return Decimal(str(shares)).quantize(SHARE_STEP), Decimal(str(round(proceeds, 6)))
+
+
+def close_trade(conn, trade, credited_now, total_proceeds, status, outcome=None):
+    balance, note = paper_session.transfer(conn, trade["id"], float(balance_in(conn) + credited_now))
+    pnl = total_proceeds - Decimal(str(trade["cash_spent"]))
+    paper_session.set_cash(conn, balance)
+    conn.execute(
+        "UPDATE trades SET resolved_outcome=?,payout=?,pnl=?,cash_after=?,status=? WHERE id=?",
+        (outcome, float(total_proceeds), float(pnl), balance, status, trade["id"]),
+    )
+    return pnl, balance, note
 
 
 def settle_pending():
@@ -129,22 +166,77 @@ def settle_pending():
         return
     if result is None:
         return
-    payout = settle(float(pos["shares"]), pos["side"], result)
-    pnl = payout - float(pos["cash_spent"])
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
-        settled = c.execute(
-            "UPDATE trades SET resolved_outcome=?,payout=?,pnl=?,status='SETTLED' WHERE id=? AND status='OPEN'",
-            (result, payout, pnl, pos["id"]),
-        )
-        if settled.rowcount != 1:
+        if not c.execute("SELECT 1 FROM trades WHERE id=? AND status='OPEN'", (pos["id"],)).fetchone():
             return
-        balance = Decimal(c.execute("SELECT value FROM settings WHERE key='cash'").fetchone()[0])
-        settled_cash = float(balance + Decimal(str(payout)))
-        new_cash, transfer_note = paper_session.transfer(c, pos["id"], settled_cash)
-        paper_session.set_cash(c, new_cash)
-        c.execute("UPDATE trades SET cash_after=? WHERE id=?", (new_cash, pos["id"]))
-    notify(f"🏁 SETTLED: {'WIN' if pnl > 0 else 'LOSS'}\n{pos['market_slug']}\nSelected {pos['side']} | Result {result}\nP&L ${pnl:+.2f}\nVirtual balance ${new_cash:.2f}{transfer_note}")
+        sold, proceeds = sales_for(c, pos["id"])
+        remaining = Decimal(str(pos["shares"])) - sold
+        payout = remaining if pos["side"] == result else Decimal(0)
+        pnl, new_cash, transfer_note = close_trade(c, pos, payout, proceeds + payout, "SETTLED", result)
+    comparison = ""
+    if sold:
+        sold_cost = sold * Decimal(str(pos["cash_spent"])) / Decimal(str(pos["shares"]))
+        hold_proceeds = sold if pos["side"] == result else Decimal(0)
+        comparison = f"\nSold shares P&L: ${proceeds - sold_cost:+.2f} | If held: ${hold_proceeds - sold_cost:+.2f}"
+    notify(f"🏁 SETTLED: {'WIN' if pos['side'] == result else 'LOSS'}\n{pos['market_slug']}\nSelected {pos['side']} | Result {result}\nTotal trade P&L ${pnl:+.2f}\nVirtual balance ${new_cash:.2f}{transfer_note}{comparison}")
+
+
+def sell_position():
+    pos = pending()
+    if pos is None:
+        return "There is no open position to sell."
+    end = market_close(pos)
+    if time.time() >= end:
+        return "The market window closed. Waiting for settlement."
+    try:
+        market = market_for(pos["market_id"])
+        up, down = token_ids(market)
+        token = up if pos["side"] == "UP" else down
+        if market.get("closed") or not market.get("acceptingOrders") or token is None:
+            return "The market is no longer accepting orders."
+        rate = market_fee_rate(market)
+        book = read_order_book(token)
+        book_time = int(book["timestamp"]) / 1000
+        book_key = book.get("hash") or str(book["timestamp"])
+        with db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            if now >= end or not -2 <= now - book_time <= MAX_BOOK_AGE:
+                return "The sell quote expired. No paper sale recorded."
+            if not c.execute("SELECT 1 FROM trades WHERE id=? AND status='OPEN'", (pos["id"],)).fetchone():
+                return "The position has already closed."
+            if c.execute(
+                "SELECT 1 FROM paper_sales WHERE trade_id=? AND book_key=?", (pos["id"], book_key),
+            ).fetchone():
+                return "That order-book snapshot was already used. Still holding the remaining shares."
+            original_shares = Decimal(str(pos["shares"]))
+            cost = Decimal(str(pos["cash_spent"])) / original_shares
+            sold, total_proceeds = sales_for(c, pos["id"])
+            remaining = original_shares - sold
+            sale = estimate_profitable_sell(book, remaining, cost, rate)
+            if sale is None:
+                return "There isn't enough visible size at a profitable bid after fees. Still holding."
+            quantity, price, fee, proceeds = sale
+            c.execute(
+                "INSERT INTO paper_sales(trade_id,sold_at,shares,price,fee,net_proceeds,book_key) VALUES(?,?,?,?,?,?,?)",
+                (pos["id"], datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                 float(quantity), float(price), float(fee), float(proceeds), book_key),
+            )
+            remaining -= quantity
+            if remaining == 0:
+                _, _, note = close_trade(c, pos, proceeds, total_proceeds + proceeds, "SOLD")
+            else:
+                paper_session.set_cash(c, balance_in(c) + proceeds)
+                note = ""
+    except (ValueError, KeyError, InvalidOperation, requests.RequestException) as exc:
+        print(f"Paper sell quote failed: {type(exc).__name__}", flush=True)
+        return "Could not verify the sell quote. No paper sale recorded."
+    return (
+        f"Paper sale: {quantity} shares at ${price:.3f}. Fee ${fee:.5f}.\n"
+        f"Realized profit on this sale ${proceeds - quantity * cost:+.5f}. "
+        f"Still holding {remaining} shares.{note}"
+    )
 
 
 def scan():
@@ -181,9 +273,13 @@ def scan():
         return
     price, market, end, side, token = max(candidates, key=lambda candidate: candidate[0])
     try:
+        if stop_event.wait(PAPER_FILL_DELAY):
+            return
         book = read_order_book(token)
         book_time = int(book["timestamp"])
-        estimate = estimate_buy(book, Decimal(str(balance)), Decimal(str(price)), market_fee_rate(market))
+        estimate = estimate_buy(
+            book, Decimal(str(balance)), Decimal(str(price)), market_fee_rate(market), allow_partial=True,
+        )
     except (ValueError, KeyError, InvalidOperation, requests.RequestException) as exc:
         print(f"Execution check failed for {market['slug']}: {exc}", flush=True)
         return
@@ -219,7 +315,7 @@ def scan():
             (trade.lastrowid, token, book_time, book.get("hash"), float(estimate["available_shares"]), fee),
         )
         paper_session.set_cash(c, estimate["unused_budget"])
-    notify(f"📝 PAPER TRADE\n{market.get('question') or market.get('slug')}\nSide {side} @ {entry:.3f}\nT-{left:.1f}s\nVirtual cost ${spent:.2f} (est. fee ${fee:.5f})\nVisible shares at ask: {estimate['available_shares']}\nNo real order placed.")
+    notify(f"📝 PAPER TRADE\n{market.get('question') or market.get('slug')}\nSide {side} @ {entry:.3f}\nT-{left:.1f}s\nFilled {estimate['estimated_order_shares']} of {estimate['desired_shares']} shares\nVirtual cost ${spent:.2f} (est. fee ${fee:.5f})\nCash left ${estimate['unused_budget']:.2f}\nNo real order placed.")
 
 
 def close_session_if_due():
@@ -234,25 +330,60 @@ def close_session_if_due():
         notify(report)
 
 
+def verify_early_sale(after_id=0):
+    with db() as c:
+        rows = c.execute(
+            """SELECT * FROM trades WHERE status='SOLD' AND resolved_outcome IS NULL
+               ORDER BY id <= ?, id""",
+            (after_id,),
+        ).fetchall()
+    now = time.time()
+    trade = next((row for row in rows if now >= market_close(row)), None)
+    if trade is None:
+        return after_id
+    try:
+        outcome = outcome_for(trade["market_id"])
+    except requests.RequestException as exc:
+        print(f"Paper sale resolution lookup failed: {type(exc).__name__}", flush=True)
+        return trade["id"]
+    if outcome is None:
+        return trade["id"]
+    with db() as c:
+        updated = c.execute(
+            "UPDATE trades SET resolved_outcome=? WHERE id=? AND status='SOLD' AND resolved_outcome IS NULL",
+            (outcome, trade["id"]),
+        ).rowcount
+    if updated:
+        hold_pnl = (trade["shares"] if outcome == trade["side"] else 0) - trade["cash_spent"]
+        notify(
+            f"Official result after paper sale: {trade['market_slug']} → {outcome}\n"
+            f"Net P&L selling: ${trade['pnl']:+.2f} | Holding: ${hold_pnl:+.2f}"
+        )
+    return trade["id"]
+
+
 def quote_interval():
     return max(MIN_QUOTE_INTERVAL, float(get("poll_seconds")))
 
 
 def engine():
-    next_scan = next_settlement = 0
+    next_scan = next_settlement = next_sale_check = 0
+    last_sale_checked = 0
     while not stop_event.is_set():
         try:
             now = time.monotonic()
             position = pending()
             if position and now >= next_settlement:
-                closes_at = datetime.fromisoformat(position["entry_time"]).timestamp() + position["seconds_to_end"]
-                if time.time() >= closes_at:
+                if time.time() >= market_close(position):
                     next_settlement = now + SETTLEMENT_INTERVAL
                     settle_pending()
             close_session_if_due()
             if not position and now >= next_scan and get("active"):
                 next_scan = now + quote_interval()
                 scan()
+            if now >= next_sale_check:
+                next_sale_check = now + SETTLEMENT_INTERVAL
+                last_sale_checked = verify_early_sale(last_sale_checked)
         except Exception as exc:
             print(f"Engine error: {type(exc).__name__}: {exc}", flush=True)
         stop_event.wait(1)
@@ -260,10 +391,10 @@ def engine():
 
 def stats():
     with db() as c:
-        rows = c.execute("SELECT pnl FROM trades WHERE status='SETTLED'").fetchall()
-    pnls = [float(x["pnl"]) for x in rows]
-    wins = sum(x > 0 for x in pnls)
-    return f"Settled: {len(pnls)} | Wins: {wins} | Losses: {len(pnls)-wins}\nWin rate: {100*wins/len(pnls):.1f}%" if pnls else "No settled trades yet."
+        total, wins = c.execute(
+            "SELECT COUNT(resolved_outcome), COUNT(CASE WHEN resolved_outcome=side THEN 1 END) FROM trades"
+        ).fetchone()
+    return f"Resolved: {total} | Wins: {wins} | Losses: {total-wins}\nWin rate: {wins/total:.1%}" if total else "No settled trades yet."
 
 
 def command(chat, user, message):
@@ -292,6 +423,13 @@ def command(chat, user, message):
         send(chat, reply)
     elif cmd in ("/stop", "/pause"):
         put("active", False); send(chat, "⏸️ New entries paused. Open position still monitored.")
+    elif cmd == "/endsession":
+        with db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            reply = paper_session.end(c, time.time())
+        send(chat, reply)
+    elif cmd == "/sell":
+        send(chat, sell_position())
     elif cmd == "/status":
         p = pending()
         with db() as c:
@@ -306,10 +444,13 @@ def command(chat, user, message):
     elif cmd == "/report":
         with db() as c:
             session = paper_session.latest(c)
+            provisional = paper_session.timeout_report(c, session["id"]) if session else None
         if session is None:
             reply = "No overnight session yet. Use /overnight <virtual-wallet-label>."
         elif session["report"] is not None:
             reply = session["report"]
+        elif provisional:
+            reply = provisional
         elif time.time() >= session["ends_at"]:
             reply = "Entry window closed. Final report is pending settlement or the next bot check."
         else:
@@ -350,7 +491,7 @@ def command(chat, user, message):
         except requests.RequestException as exc:
             send(chat, f"Market lookup failed: {exc}")
     else:
-        send(chat, "/overnight <virtual-wallet-label> /wallet /report\n/start /stop /status /balance /trades /stats /markets /settings\n/set threshold 0.82\n/set entry_window 120\n/set poll_seconds 10\n/help")
+        send(chat, "/overnight <virtual-wallet-label> /endsession /wallet /report\n/start /stop /sell /status /balance /trades /stats /markets /settings\n/set threshold 0.82\n/set entry_window 120\n/set poll_seconds 10\n/help")
 
 
 def telegram():

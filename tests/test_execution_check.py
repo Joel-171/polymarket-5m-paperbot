@@ -36,3 +36,15 @@ class TestExecutionCheck(unittest.TestCase):
         quote = self.quote([("0.80", "100")], fee="0")
         self.assertTrue(quote["fits"])
         self.assertEqual(quote["estimated_total_cost"], Decimal("10"))
+
+    def test_partial_fill_leaves_cash_and_does_not_chase_price(self):
+        book = {
+            "min_order_size": "5",
+            "asks": [{"price": "0.88", "size": "7"}, {"price": "0.90", "size": "20"}],
+        }
+        fill = estimate_buy(
+            book, Decimal("10"), Decimal("0.88"), Decimal("0"), allow_partial=True,
+        )
+        self.assertTrue(fill["fits"])
+        self.assertEqual(fill["estimated_order_shares"], Decimal("7"))
+        self.assertEqual(fill["unused_budget"], Decimal("3.84"))

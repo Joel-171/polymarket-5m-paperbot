@@ -7,21 +7,25 @@ Paper-only research software. Telegram controls monitoring and reports. The engi
 - Entry during final 120 seconds.
 - Trigger: best executable ask >= 0.80.
 - Choose the highest qualifying ask among discovered eligible markets.
-- Budget up to 100% of virtual cash including estimated taker fees, with one
-  open position at a time. Reject shallow or stale books and leave rounding
-  leftovers in cash.
-- Settlement heuristic: Gamma market is closed and one of two outcome prices is >= 0.99.
+- Budget up to 100% of virtual cash including estimated taker fees. Use visible
+  shares at the best ask, up to the price selected by the quote scan, and keep
+  unspent cash idle while the position is open. Skip old or subminimum fills.
+- Hold until the public market is resolved at $1 for one outcome. Use
+  `/sell` for an early paper sale only when the visible bid can cover the
+  allocated entry cost and exit fee.
 
 An 80-cent contract is not proof of an 80% true win probability. A losing all-in position can wipe out the virtual bankroll. This is a research setting, not a recommendation.
 
 ## Telegram commands
 /start resume monitoring; /stop pause new entries; /status; /balance; /trades; /stats; /markets; /settings; /help.
+`/endsession` closes new entries and requests the report. `/sell` checks the
+open position for a profitable simulated early exit.
 Change settings with /set threshold 0.82, /set entry_window 120, or /set poll_seconds 10.
 Only TELEGRAM_ALLOWED_USER_ID can control the bot.
 
 Quote checks start in the entry window. Market listings are cached, there is
 one compact price request per scan, and only the selected outcome gets a
-full order-book request. Quote polling is clamped to at least 10 seconds
+full order-book request after a modeled 0.3-second delay. Quote polling is clamped to at least 10 seconds
 (set 10–60 with `/set poll_seconds`). Pending trades are checked for
 settlement at most once per 30 seconds after close.
 
@@ -44,6 +48,12 @@ Use `/status` in Telegram to confirm it responds.
   trade still settles. The bot then sends the final report to the authorized
   Telegram user. `/report` retrieves it and `/wallet` shows virtual transfers
   grouped by destination.
+- `/endsession` ends entries early. If an open position still has no result after
+  30 minutes, the bot sends a provisional report with the remaining shares at
+  cost, then follows up once the trade resolves. The report compares the
+  share-weighted entry win rate with the average entry cost including estimated
+  entry fees, using trades with verified outcomes. It reports early-sale
+  P&L separately.
 - The cutoff, open position, and virtual transfers survive a process restart
   with the same SQLite database. `/stop` pauses entries without extending the
   cutoff. Starting another session creates a fresh $10 paper bankroll and
@@ -81,4 +91,4 @@ python -m unittest discover -s tests -v
 python -m py_compile collector.py strategy.py backtest.py service.py
 
 ## Limitations
-Market discovery depends on Polymarket's current five-minute event slug format. Inspect each market's exact question and resolution terms. Paper entries use a recent best-ask snapshot, visible size and estimated market taker fees. They do not model depth walking, partial fills, network latency, queue position or actual execution. The settlement heuristic is not a substitute for verifying official resolution. No profitability claim is made. Historical snapshots and verified settlements are required for meaningful backtesting.
+Market discovery depends on Polymarket's current five-minute event slug format. Paper fills use visible depth at one price level and estimated fees. The delay is a simulation setting. Actual matching, queue position, and deeper price levels are outside this model. A fresh $10 session starts only when requested.

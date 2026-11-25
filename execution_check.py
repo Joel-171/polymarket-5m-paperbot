@@ -13,8 +13,12 @@ SHARE_STEP = Decimal("0.01")
 FEE_STEP = Decimal("0.00001")
 
 
-def estimate_buy(book, budget, max_price, fee_rate):
-    """Require enough depth at one price for the fee-adjusted order size."""
+def taker_fee(shares, price, rate):
+    return (shares * rate * price * (1 - price)).quantize(FEE_STEP, rounding=ROUND_HALF_UP)
+
+
+def estimate_buy(book, budget, max_price, fee_rate, *, allow_partial=False):
+    """Estimate a fee-adjusted buy at one price level."""
     if not budget.is_finite() or budget <= 0:
         raise ValueError("Budget must be positive and finite.")
     if not max_price.is_finite() or not 0 < max_price < 1:
@@ -32,17 +36,20 @@ def estimate_buy(book, budget, max_price, fee_rate):
     # Leave room for the fee to round up without exceeding the budget.
     rounding_allowance = FEE_STEP / 2 if fee_rate else Decimal(0)
     spendable = max(Decimal(0), budget - rounding_allowance)
-    shares = (spendable / (best_ask + fee_per_share)).quantize(SHARE_STEP, rounding=ROUND_DOWN)
-    fee = (shares * fee_per_share).quantize(FEE_STEP, rounding=ROUND_HALF_UP)
+    desired = (spendable / (best_ask + fee_per_share)).quantize(SHARE_STEP, rounding=ROUND_DOWN)
+    shares = min(desired, available_shares).quantize(SHARE_STEP, rounding=ROUND_DOWN) if allow_partial else desired
+    fee = taker_fee(shares, best_ask, fee_rate)
     total = shares * best_ask + fee
     minimum_shares = Decimal(book["min_order_size"])
     reason = None
     if best_ask > max_price:
         reason = "Best ask exceeds the price cap."
-    elif shares <= 0 or shares < minimum_shares:
+    elif desired < minimum_shares:
         reason = "The budget cannot buy the minimum order size."
-    elif available_shares < shares:
+    elif not allow_partial and available_shares < shares:
         reason = "Insufficient shares at the best ask for the full estimated order."
+    elif shares <= 0 or shares < minimum_shares:
+        reason = "Visible size is below the modeled minimum fill."
     return {
         "fits": reason is None,
         "reason": reason,
@@ -50,10 +57,28 @@ def estimate_buy(book, budget, max_price, fee_rate):
         "available_shares": available_shares,
         "minimum_shares": minimum_shares,
         "estimated_order_shares": shares,
+        "desired_shares": desired,
         "estimated_taker_fee": fee,
         "estimated_total_cost": total,
         "unused_budget": budget - total,
     }
+
+
+def estimate_profitable_sell(book, shares, cost_per_share, fee_rate):
+    bids = [(Decimal(row["price"]), Decimal(row["size"])) for row in book["bids"]]
+    bids = [(price, size) for price, size in bids if 0 < price < 1 and size > 0]
+    if not bids:
+        return None
+    price = max(price for price, _ in bids)
+    depth = sum(size for bid, size in bids if bid == price)
+    quantity = min(shares, depth).quantize(SHARE_STEP, rounding=ROUND_DOWN)
+    if quantity <= 0 or quantity < Decimal(book["min_order_size"]):
+        return None
+    fee = taker_fee(quantity, price, fee_rate)
+    proceeds = quantity * price - fee
+    if proceeds <= quantity * cost_per_share:
+        return None
+    return quantity, price, fee, proceeds
 
 
 def market_fee_rate(market):
