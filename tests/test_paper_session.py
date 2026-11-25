@@ -228,3 +228,24 @@ class TestPaperSession(unittest.TestCase):
             service.close_session_if_due()
         self.assertIn("Net P&L: $+2.50", self.send.call_args.args[1])
         self.assertIn("100.0% vs 80.0% break-even", self.send.call_args.args[1])
+
+    def test_saved_position_settles_when_result_is_automatic_without_uma_status(self):
+        self.scan(1, self.start + 210, self.start + 300)
+        result = {
+            "closed": True, "automaticallyResolved": True, "umaResolutionStatus": None,
+            "outcomes": '["Up", "Down"]', "outcomePrices": '["1", "0"]',
+        }
+        with patch.object(service, "market_for", return_value=result):
+            service.settle_pending()
+        self.assertIsNone(service.pending())
+        self.assertEqual(service.cash(), 12.5)
+        self.assertIn("SETTLED: WIN", self.send.call_args.args[1])
+
+    def test_does_not_treat_closed_or_indicative_prices_as_final(self):
+        market = {"closed": True, "outcomes": ["Up", "Down"], "outcomePrices": ["0", "1"]}
+        with patch.object(service, "market_for", return_value=market):
+            self.assertIsNone(service.outcome_for("1"))
+            market["umaResolutionStatus"] = "resolved"
+            self.assertEqual(service.outcome_for("1"), "DOWN")
+            market["outcomePrices"] = ["0.01", "0.99"]
+            self.assertIsNone(service.outcome_for("1"))

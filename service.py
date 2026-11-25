@@ -116,16 +116,19 @@ def market_for(market_id):
 
 def outcome_for(market_id):
     m = market_for(market_id)
-    if not m.get("closed") or m.get("umaResolutionStatus") != "resolved":
+    resolved = m.get("automaticallyResolved") is True or m.get("umaResolutionStatus") == "resolved"
+    if not m.get("closed") or not resolved:
         return None
-    outcomes, prices = as_list(m.get("outcomes")), as_list(m.get("outcomePrices"))
-    if len(outcomes) != 2 or len(prices) != 2:
+    outcomes = [str(outcome).strip().upper() for outcome in as_list(m.get("outcomes"))]
+    if len(outcomes) != 2 or set(outcomes) != {"UP", "DOWN"}:
         return None
     try:
-        winners = [str(o).strip().upper() for o, p in zip(outcomes, prices) if float(p) == 1]
+        prices = tuple(float(price) for price in as_list(m.get("outcomePrices")))
     except (ValueError, TypeError):
         return None
-    return winners[0] if len(winners) == 1 and winners[0] in {"UP", "DOWN"} else None
+    if prices not in ((1.0, 0.0), (0.0, 1.0)):
+        return None
+    return outcomes[prices.index(1.0)]
 
 
 def market_close(trade):
