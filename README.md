@@ -92,3 +92,46 @@ python -m py_compile collector.py strategy.py backtest.py service.py
 
 ## Limitations
 Market discovery depends on Polymarket's current five-minute event slug format. Paper fills use visible depth at one price level and estimated fees. The delay is a simulation setting. Actual matching, queue position, and deeper price levels are outside this model. A fresh $10 session starts only when requested.
+
+## One-order live test (Windows Command Prompt)
+
+This test runs from Command Prompt alongside the Telegram paper bot. It uses the
+default five-minute entry rule and prints a paper estimate for the selected
+order. It checks real fills and attempts redemption only if that order wins.
+
+Install the optional live dependency and run the read-only preview:
+
+```bat
+.venv\Scripts\python.exe -m pip install -r requirements-live.txt
+.venv\Scripts\python.exe live_test.py --cap 10
+```
+
+Run this on the network you intend to trade from. The preview checks Polymarket's
+geographic restriction endpoint and waits up to five minutes for a qualifying
+quote. It needs no wallet credentials. The cap is an upper bound for test wallet
+funding. Actual order size is based on the book minimum and rounded up to the
+next supported order amount. The preview displays the exact proposed amounts.
+
+For the funded test, use an existing, dedicated Polymarket trading wallet with
+no other orders or positions. Fund only the test amount, up to the specified
+cap. Have its signer key and the Relayer API key and associated address from
+**Polymarket → Settings → API Keys → Relayer API Keys** ready.
+[Polymarket wallet setup](https://docs.polymarket.com/trading/wallets-auth)
+
+```bat
+.venv\Scripts\python.exe live_test.py --cap 10 --execute
+```
+
+Enter the keys only in your local terminal. Key input is hidden while typing.
+Review the market, side, price and estimated maximum spend, then type `BUY` to
+approve that candidate. The runner rechecks the current book, can lower the
+limit and size, and submits at most one buy. It records confirmed fills and
+compares the dedicated wallet's collateral change with the matched notional
+to observe the fee. Avoid other activity in this wallet during the test.
+
+The runner logs events to `data/live-test.jsonl`, including order and redemption
+identifiers and measured timings. It leaves that journal in place and refuses
+to submit another order if the outcome of an earlier attempt needs
+reconciliation. On interruption or an unresolved status, check the journal and
+your account before doing anything further. The test has no automatic
+compounding or withdrawal.

@@ -6,3 +6,4 @@ venv/
 data/*.csv
 data/*.sqlite3
 data/*.db
+/data/live-test.jsonl

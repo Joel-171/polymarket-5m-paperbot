@@ -40,8 +40,11 @@ def token_ids(market):
     return mapping.get("up"), mapping.get("down")
 
 
-def read_order_book(token_id):
-    r = SESSION.get(f"{CLOB}/book", params={"token_id": token_id}, timeout=12)
+def read_order_book(token_id, *, fresh=False):
+    params = {"token_id": token_id}
+    if fresh:
+        params["_"] = time.time_ns()
+    r = SESSION.get(f"{CLOB}/book", params=params, timeout=12)
     r.raise_for_status()
     return r.json()
 

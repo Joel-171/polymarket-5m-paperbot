@@ -237,10 +237,14 @@ class TestPaperSession(unittest.TestCase):
             "outcomes": '["Up", "Down"]', "outcomePrices": '["1", "0"]',
         }
         response = Mock(status_code=200, **{"json.return_value": result})
-        with patch.object(service.SESSION, "get", return_value=response) as get:
+        with (
+            patch.object(service.SESSION, "get", return_value=response) as get,
+            patch.object(service.time, "time_ns", return_value=123),
+        ):
             service.settle_pending()
         get.assert_called_once_with(
-            f"{service.GAMMA}/markets/slug/market-1", headers={"Cache-Control": "no-cache"}, timeout=12,
+            f"{service.GAMMA}/markets/slug/market-1", params={"_": 123},
+            headers={"Cache-Control": "no-cache"}, timeout=12,
         )
         self.assertIsNone(service.pending())
         self.assertEqual(service.cash(), 12.5)
@@ -252,11 +256,13 @@ class TestPaperSession(unittest.TestCase):
         with (
             patch.object(service.SESSION, "get", side_effect=[
                 Mock(status_code=200, **{"json.return_value": resolved}), Mock(status_code=404),
-            ]),
+            ]) as get,
             patch.object(service, "market_for", return_value={**resolved, "id": "1"}) as by_id,
+            patch.object(service.time, "time_ns", side_effect=[123, 456]),
         ):
             self.assertIsNone(service.outcome_for("1", "market-1"))
             self.assertEqual(service.outcome_for("1", "market-1"), "UP")
+        self.assertEqual([call.kwargs["params"] for call in get.call_args_list], [{"_": 123}, {"_": 456}])
         by_id.assert_called_once_with("1")
 
     def test_does_not_treat_closed_or_indicative_prices_as_final(self):

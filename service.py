@@ -117,7 +117,11 @@ def market_for(market_id):
 def outcome_for(market_id, slug=None):
     if slug:
         response = SESSION.get(
-            f"{GAMMA}/markets/slug/{slug}", headers={"Cache-Control": "no-cache"}, timeout=12,
+            f"{GAMMA}/markets/slug/{slug}",
+            # A cached pre-resolution response can outlive several settlement polls.
+            params={"_": time.time_ns()},
+            headers={"Cache-Control": "no-cache"},
+            timeout=12,
         )
         if response.status_code == 404:
             m = market_for(market_id)
